@@ -176,6 +176,29 @@ async function startServer() {
       }
     });
 
+    // ============== Search Donors Route ==================
+    app.get("/donors/search", async (req, res) => {
+      try {
+        const { bloodGroup, district, upazila } = req.query;
+
+        let query = {
+          role: "donor",
+          status: "active",
+        };
+
+        if (bloodGroup) query.bloodGroup = bloodGroup;
+        if (district) query.district = district;
+        if (upazila) query.upazila = upazila;
+
+        const donors = await userCollection.find(query).toArray();
+        res.send(donors);
+      } catch (error) {
+        res
+          .status(500)
+          .send({ message: "Failed to search donors", error: error.message });
+      }
+    });
+
     // ============== donations Post Routes ==================
     app.post("/donations", async (req, res) => {
       const donations = req.body;
