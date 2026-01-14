@@ -199,6 +199,18 @@ async function startServer() {
       }
     });
 
+    // ============== Get all pending donation requests ==================
+    app.get("/donations", async (req, res) => {
+      const { status } = req.query;
+
+      let query = {};
+      if (status) {
+        query.status = status.toLowerCase();
+      }
+      const donations = await donationsCollections.find(query).toArray();
+      res.send(donations);
+    });
+
     // ============== donations Post Routes ==================
     app.post("/donations", async (req, res) => {
       const donations = req.body;
