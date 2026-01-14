@@ -40,6 +40,7 @@ async function startServer() {
     await client.connect();
     const db = client.db("BloodLink");
     const userCollection = db.collection("users");
+    const donationsCollections = db.collection("donations");
 
     // ============== blood-groups Routes ==================
     app.get("/blood-groups", (req, res) => {
@@ -66,10 +67,141 @@ async function startServer() {
       res.json(filtered);
     });
 
-    // ============== Users Routes ==================
+    // ============== Users Routes Post ==================
     app.post("/users", async (req, res) => {
       const user = req.body;
+
+      const exists = await userCollection.findOne({ uid: user.uid });
+      if (exists) {
+        return res.status(409).send({ message: "User already exists" });
+      }
+
       const result = await userCollection.insertOne(user);
+      res.status(201).send(result);
+    });
+
+    // ============== Users Routes Get user by email ==================
+    app.get("/users", async (req, res) => {
+      try {
+        const { email } = req.query;
+
+        if (!email) {
+          return res.status(400).send({ message: "Email query is required" });
+        }
+
+        const user = await userCollection.findOne({ email });
+
+        if (!user) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        res.send(user);
+      } catch (error) {
+        console.error("Get user by email error:", error);
+        res.status(500).send({ message: "Failed to fetch user" });
+      }
+    });
+
+    // ============== Users Routes Get single user by UID ==================
+    app.get("/users/:uid", async (req, res) => {
+      const user = await userCollection.findOne({ uid: req.params.uid });
+      if (!user) {
+        return res.status(404).send({ message: "User not found" });
+      }
+      res.send(user);
+    });
+
+    // ============== Users Routes update user by uid ==================
+    app.put("/users/:uid", async (req, res) => {
+      const allowedFields = [
+        "name",
+        "bloodGroup",
+        "district",
+        "upazila",
+        "photoURL",
+      ];
+
+      const payload = {};
+      for (const key of allowedFields) {
+        if (key in req.body) payload[key] = req.body[key];
+      }
+
+      const result = await userCollection.findOneAndUpdate(
+        { uid: req.params.uid },
+        { $set: payload },
+        { returnDocument: "after" }
+      );
+
+      if (!result) {
+        return res.status(404).send({ message: "User not found" });
+      }
+
+      res.send(result);
+      res.status(500).send({ message: "Failed to update user" });
+    });
+
+    // ============== donations Get Routes ==================
+    app.get("/donations/:id", async (req, res) => {
+      const { id } = req.params;
+      const donations = await donationsCollections.findOne({
+        _id: new ObjectId(id),
+      });
+      if (!donations) return res.status(404).send("User not found");
+      res.send(donations);
+    });
+
+    // ============== donations Get by search and filters Routes ==================
+    app.get("/donations/user/:email", async (req, res) => {
+      try {
+        const { email } = req.params; // ✅ Destructure করো
+        const { status, search } = req.query;
+
+        let query = { requesterEmail: email };
+
+        if (status && status.toLowerCase() !== "all") {
+          query.status = status.toLowerCase();
+        }
+
+        if (search) {
+          query.$or = [
+            { recipientName: { $regex: search, $options: "i" } },
+            { hospitalName: { $regex: search, $options: "i" } },
+          ];
+        }
+
+        const donations = await donationsCollections.find(query).toArray();
+        res.send(donations);
+      } catch (error) {
+        res.status(500).send({ message: "server error", error: error.message });
+      }
+    });
+
+    // ============== donations Post Routes ==================
+    app.post("/donations", async (req, res) => {
+      const donations = req.body;
+      const result = await donationsCollections.insertOne(donations);
+      res.status(201).send(result);
+    });
+
+    // ============== donations Put Routes ==================
+    app.put("/donations/:id", async (req, res) => {
+      const id = req.params.id;
+      const filter = { _id: new ObjectId(id) };
+      const updateData = req.body;
+
+      const { _id, ...updateDocWithoutId } = updateData;
+
+      const updateDoc = {
+        $set: updateDocWithoutId,
+      };
+      const result = await donationsCollections.updateOne(filter, updateDoc);
+    });
+
+    // ============== donations Delete Routes ==================
+    app.delete("/donations/:id", async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await donationsCollections.deleteOne(query);
       res.send(result);
     });
 
