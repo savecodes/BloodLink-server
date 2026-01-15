@@ -66,20 +66,6 @@ async function startServer() {
 
       res.json(filtered);
     });
-
-    // ============== Users Routes Post ==================
-    app.post("/users", async (req, res) => {
-      const user = req.body;
-
-      const exists = await userCollection.findOne({ uid: user.uid });
-      if (exists) {
-        return res.status(409).send({ message: "User already exists" });
-      }
-
-      const result = await userCollection.insertOne(user);
-      res.status(201).send(result);
-    });
-
     // ============== Users Routes Get user by email ==================
     app.get("/users", async (req, res) => {
       try {
@@ -102,6 +88,15 @@ async function startServer() {
       }
     });
 
+    // ============== Users Routes get ==================
+    app.get("/users/role/:email", async (req, res) => {
+      const email = req.params.email;
+
+      const result = await userCollection.findOne({ email });
+
+      res.status(201).send({ role: result?.role });
+    });
+
     // ============== Users Routes Get single user by UID ==================
     app.get("/users/:uid", async (req, res) => {
       const user = await userCollection.findOne({ uid: req.params.uid });
@@ -109,6 +104,19 @@ async function startServer() {
         return res.status(404).send({ message: "User not found" });
       }
       res.send(user);
+    });
+
+    // ============== Users Routes Post ==================
+    app.post("/users", async (req, res) => {
+      const user = req.body;
+
+      const exists = await userCollection.findOne({ uid: user.uid });
+      if (exists) {
+        return res.status(409).send({ message: "User already exists" });
+      }
+
+      const result = await userCollection.insertOne(user);
+      res.status(201).send(result);
     });
 
     // ============== Users Routes update user by uid ==================
@@ -174,6 +182,24 @@ async function startServer() {
       } catch (error) {
         res.status(500).send({ message: "server error", error: error.message });
       }
+    });
+
+    // ============== donations dashboard Get Routes ==================
+    app.get("/donations/dashboard/:email", async (req, res) => {
+      const { email } = req.params;
+      const donations = await donationsCollections
+        .find({ requesterEmail: email })
+        .sort({ createdAt: -1 })
+        .toArray();
+      const summary = {
+        total: donations.length,
+        pending: donations.filter((d) => d.status === "pending").length,
+        completed: donations.filter((d) => d.status === "completed").length,
+        cancelled: donations.filter((d) => d.status === "cancelled").length,
+        recent: donations.slice(0, 4),
+      };
+
+      res.send(summary);
     });
 
     // ============== Search Donors Route ==================
