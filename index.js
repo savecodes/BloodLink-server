@@ -67,6 +67,11 @@ async function startServer() {
       res.json(filtered);
     });
 
+    // ============== All Users Get Routes ==================
+    app.get("/users", async (req, res) => {
+      const users = await userCollection.find().toArray();
+      res.send(users);
+    });
 
     // ============== Users Routes Get user by email ==================
     app.get("/users", async (req, res) => {
