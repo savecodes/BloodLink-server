@@ -66,6 +66,8 @@ async function startServer() {
 
       res.json(filtered);
     });
+
+
     // ============== Users Routes Get user by email ==================
     app.get("/users", async (req, res) => {
       try {
@@ -256,6 +258,7 @@ async function startServer() {
         $set: updateDocWithoutId,
       };
       const result = await donationsCollections.updateOne(filter, updateDoc);
+      res.send(result);
     });
 
     // ============== donations Delete Routes ==================
@@ -264,6 +267,59 @@ async function startServer() {
       const query = { _id: new ObjectId(id) };
       const result = await donationsCollections.deleteOne(query);
       res.send(result);
+    });
+
+    // ============== Dashboard Statistics Routes For Admin ==================
+    app.get("/dashboard/stats", async (req, res) => {
+      try {
+        const totalUsers = await userCollection.countDocuments({
+          role: "donor",
+        });
+
+        const totalDonationRequests =
+          await donationsCollections.countDocuments();
+        const totalFunding = 0;
+
+        // Blood Group Distribution
+        const bloodGroupStats = await donationsCollections
+          .aggregate([
+            {
+              $group: {
+                _id: "$bloodGroup",
+                count: { $sum: 1 },
+              },
+            },
+          ])
+          .toArray();
+
+        const bloodGroupDistribution = bloodGroupStats.map((item) => ({
+          name: item._id,
+          value: item.count,
+        }));
+
+        // Monthly Funding (dummy data for now)
+        const monthlyFundingData = [
+          { month: "Jan", funding: 5000 },
+          { month: "Feb", funding: 7500 },
+          { month: "Mar", funding: 6200 },
+          { month: "Apr", funding: 8900 },
+          { month: "May", funding: 12000 },
+          { month: "Jun", funding: 10500 },
+        ];
+
+        res.send({
+          totalUsers,
+          totalFunding,
+          totalDonationRequests,
+          bloodGroupDistribution,
+          monthlyFundingData,
+        });
+      } catch (error) {
+        res.status(500).send({
+          message: "Failed to load dashboard stats",
+          error: error.message,
+        });
+      }
     });
 
     await client.db("admin").command({ ping: 1 });
