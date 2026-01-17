@@ -69,7 +69,15 @@ async function startServer() {
 
     // ============== All Users Get Routes ==================
     app.get("/users", async (req, res) => {
-      const users = await userCollection.find().toArray();
+      const { search } = req.query;
+      let query = {};
+      if (search) {
+        query.$or = [
+          { name: { $regex: search, $options: "i" } },
+          { email: { $regex: search, $options: "i" } },
+        ];
+      }
+      const users = await userCollection.find(query).toArray();
       res.send(users);
     });
 
@@ -101,7 +109,10 @@ async function startServer() {
 
       const result = await userCollection.findOne({ email });
 
-      res.status(201).send({ role: result?.role });
+      res.status(201).send({
+        role: result?.role,
+        status: result?.status,
+      });
     });
 
     // ============== Users Routes Get single user by UID ==================
@@ -124,6 +135,34 @@ async function startServer() {
 
       const result = await userCollection.insertOne(user);
       res.status(201).send(result);
+    });
+
+    // ============== Users Role Update ==================
+    app.patch("/users/:id/role", async (req, res) => {
+      const { id } = req.params;
+      const { role } = req.body;
+
+      const filter = { _id: new ObjectId(id) };
+      const updateDoc = {
+        $set: { role },
+      };
+
+      const result = await userCollection.updateOne(filter, updateDoc);
+      res.send(result);
+    });
+
+    // ============== Users Status Update ==================
+    app.patch("/users/:id/status", async (req, res) => {
+      const { id } = req.params;
+      const { status } = req.body;
+
+      const filter = { _id: new ObjectId(id) };
+      const updateDoc = {
+        $set: { status },
+      };
+
+      const result = await userCollection.updateOne(filter, updateDoc);
+      res.send(result);
     });
 
     // ============== Users Routes update user by uid ==================
@@ -153,6 +192,12 @@ async function startServer() {
 
       res.send(result);
       res.status(500).send({ message: "Failed to update user" });
+    });
+
+    // ============== donations Get Routes ==================
+    app.get("/all-donations", async (req, res) => {
+      const donations = await donationsCollections.find().toArray();
+      res.send(donations);
     });
 
     // ============== donations Get Routes ==================
@@ -248,6 +293,25 @@ async function startServer() {
     app.post("/donations", async (req, res) => {
       const donations = req.body;
       const result = await donationsCollections.insertOne(donations);
+      res.status(201).send(result);
+    });
+
+    // ============== donations Post Routes for check user is blocked or not==================
+    app.post("/donations", async (req, res) => {
+      const donation = req.body;
+
+      const user = await userCollection.findOne({
+        email: donation.requesterEmail,
+      });
+
+      if (user?.status === "blocked") {
+        return res.status(403).send({
+          message:
+            "Your account is blocked. You cannot post donation requests.",
+        });
+      }
+
+      const result = await donationsCollections.insertOne(donation);
       res.status(201).send(result);
     });
 
