@@ -4,6 +4,7 @@ import fs from "fs";
 import dotenv from "dotenv";
 import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
 dotenv.config();
+import admin from "firebase-admin";
 
 import Stripe from "stripe";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -23,6 +24,16 @@ app.use(
   }),
 );
 app.use(express.json());
+
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8",
+);
+const serviceAccount = JSON.parse(decoded);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
 const uri = process.env.MONGO_URI;
 
 const client = new MongoClient(uri, {
@@ -43,6 +54,21 @@ app.get("/", (req, res) => {
   res.send("Blood Donation Backend Running");
 });
 
+const verifyFbToken = async (req, res, next) => {
+  const token = req.headers.authorization;
+  if (!token) {
+    return res.status(401).send({ message: "unauthorized access" });
+  }
+  try {
+    const idToken = token.split(" ")[1];
+    const decode = await admin.auth().verifyIdToken(idToken);
+    req.decode_email = decode.email;
+    next();
+  } catch (error) {
+    return res.status(401).send({ message: "unauthorized access" });
+  }
+};
+
 async function startServer() {
   try {
     await client.connect();
@@ -50,6 +76,61 @@ async function startServer() {
     const userCollection = db.collection("users");
     const donationsCollections = db.collection("donations");
     const fundingCollections = db.collection("funding");
+
+    // Middleware
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.decode_email;
+      const query = { email };
+      const user = await userCollection.findOne(query);
+      if (!user) {
+        return res.status(401).send({ message: "Unauthorized" });
+      }
+
+      if (!user || user.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
+
+    const verifyVolunteer = async (req, res, next) => {
+      const email = req.decode_email;
+      const user = await userCollection.findOne({ email });
+
+      if (!user) {
+        return res.status(401).send({ message: "Unauthorized" });
+      }
+
+      if (user.role !== "volunteer" && user.role !== "admin") {
+        return res.status(403).send({ message: "Forbidden access" });
+      }
+
+      next();
+    };
+
+    const verifyOwner = async (req, res, next) => {
+      const userEmail = req.decode_email;
+      const donationId = req.params.id;
+
+      const donation = await donationsCollections.findOne({
+        _id: new ObjectId(donationId),
+      });
+
+      if (!donation) {
+        return res.status(404).send({ message: "Donation not found" });
+      }
+
+      if (donation.requesterEmail !== userEmail) {
+        const user = await userCollection.findOne({ email: userEmail });
+        if (!user || user.role !== "admin") {
+          return res
+            .status(403)
+            .send({ message: "Forbidden: not your donation" });
+        }
+      }
+
+      req.donation = donation;
+      next();
+    };
 
     // ============== blood-groups Routes ==================
     app.get("/blood-groups", (req, res) => {
@@ -76,8 +157,20 @@ async function startServer() {
       res.json(filtered);
     });
 
+    // ============== Users Routes get ==================
+    app.get("/users/role/:email", verifyFbToken, async (req, res) => {
+      const email = req.params.email;
+
+      const result = await userCollection.findOne({ email });
+
+      res.status(201).send({
+        role: result?.role,
+        status: result?.status,
+      });
+    });
+
     // ============== All Users Get, search, by email  Routes ==================
-    app.get("/users", async (req, res) => {
+    app.get("/users", verifyFbToken, verifyAdmin, async (req, res) => {
       try {
         let { search = "", page = 1, limit = 10 } = req.query;
         page = Number(page);
@@ -96,7 +189,7 @@ async function startServer() {
         const [data, total] = await Promise.all([
           userCollection
             .find(query)
-            .sort({ name: 1 })
+            .sort({ createdAt: -1 })
             .skip(skip)
             .limit(limit)
             .toArray(),
@@ -118,20 +211,8 @@ async function startServer() {
       }
     });
 
-    // ============== Users Routes get ==================
-    app.get("/users/role/:email", async (req, res) => {
-      const email = req.params.email;
-
-      const result = await userCollection.findOne({ email });
-
-      res.status(201).send({
-        role: result?.role,
-        status: result?.status,
-      });
-    });
-
     // ============== Users Routes Get single user by UID ==================
-    app.get("/users/:uid", async (req, res) => {
+    app.get("/users/:uid", verifyFbToken, async (req, res) => {
       const user = await userCollection.findOne({ uid: req.params.uid });
       if (!user) {
         return res.status(404).send({ message: "User not found" });
@@ -153,35 +234,45 @@ async function startServer() {
     });
 
     // ============== Users Role Update ==================
-    app.patch("/users/:id/role", async (req, res) => {
-      const { id } = req.params;
-      const { role } = req.body;
+    app.patch(
+      "/users/:id/role",
+      verifyFbToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+        const { role } = req.body;
 
-      const filter = { _id: new ObjectId(id) };
-      const updateDoc = {
-        $set: { role },
-      };
+        const filter = { _id: new ObjectId(id) };
+        const updateDoc = {
+          $set: { role },
+        };
 
-      const result = await userCollection.updateOne(filter, updateDoc);
-      res.send(result);
-    });
+        const result = await userCollection.updateOne(filter, updateDoc);
+        res.send(result);
+      },
+    );
 
     // ============== Users Status Update ==================
-    app.patch("/users/:id/status", async (req, res) => {
-      const { id } = req.params;
-      const { status } = req.body;
+    app.patch(
+      "/users/:id/status",
+      verifyFbToken,
+      verifyAdmin,
+      async (req, res) => {
+        const { id } = req.params;
+        const { status } = req.body;
 
-      const filter = { _id: new ObjectId(id) };
-      const updateDoc = {
-        $set: { status },
-      };
+        const filter = { _id: new ObjectId(id) };
+        const updateDoc = {
+          $set: { status },
+        };
 
-      const result = await userCollection.updateOne(filter, updateDoc);
-      res.send(result);
-    });
+        const result = await userCollection.updateOne(filter, updateDoc);
+        res.send(result);
+      },
+    );
 
     // ============== Users Routes update user by uid ==================
-    app.put("/users/:uid", async (req, res) => {
+    app.put("/users/:uid", verifyFbToken, async (req, res) => {
       const allowedFields = [
         "name",
         "bloodGroup",
@@ -206,71 +297,65 @@ async function startServer() {
       }
 
       res.send(result);
-      res.status(500).send({ message: "Failed to update user" });
     });
 
     // ============== All donations Get Routes ==================
-    app.get("/all-donations", async (req, res) => {
-      try {
-        let { page = 1, limit = 10, search = "", status } = req.query;
-        page = Number(page);
-        limit = Number(limit);
+    app.get(
+      "/all-donations",
+      verifyFbToken,
+      verifyVolunteer,
+      async (req, res) => {
+        try {
+          let { page = 1, limit = 10, search = "", status } = req.query;
+          page = Number(page);
+          limit = Number(limit);
 
-        const query = {};
+          const query = {};
 
-        if (status && status !== "All Status") {
-          query.status = status.toLowerCase();
+          if (status && status !== "All Status") {
+            query.status = status.toLowerCase();
+          }
+
+          if (search) {
+            query.$or = [
+              { recipientName: { $regex: search, $options: "i" } },
+              { requesterName: { $regex: search, $options: "i" } },
+              { hospitalName: { $regex: search, $options: "i" } },
+              { bloodGroup: { $regex: search, $options: "i" } },
+            ];
+          }
+
+          const skip = (page - 1) * limit;
+
+          const [data, total] = await Promise.all([
+            donationsCollections
+              .find(query)
+              .sort({ createdAt: -1 })
+              .skip(skip)
+              .limit(limit)
+              .toArray(),
+
+            donationsCollections.countDocuments(query),
+          ]);
+
+          res.send({
+            data,
+            pagination: {
+              total,
+              page,
+              limit,
+              totalPages: Math.ceil(total / limit),
+            },
+          });
+        } catch (error) {
+          console.error(error);
+          res.status(500).send({ message: "Server error" });
         }
-
-        if (search) {
-          query.$or = [
-            { recipientName: { $regex: search, $options: "i" } },
-            { requesterName: { $regex: search, $options: "i" } },
-            { hospitalName: { $regex: search, $options: "i" } },
-            { bloodGroup: { $regex: search, $options: "i" } },
-          ];
-        }
-
-        const skip = (page - 1) * limit;
-
-        const [data, total] = await Promise.all([
-          donationsCollections
-            .find(query)
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(limit)
-            .toArray(),
-
-          donationsCollections.countDocuments(query),
-        ]);
-
-        res.send({
-          data,
-          pagination: {
-            total,
-            page,
-            limit,
-            totalPages: Math.ceil(total / limit),
-          },
-        });
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({ message: "Server error" });
-      }
-    });
-
-    // ============== donations Get Routes ==================
-    app.get("/donations/:id", async (req, res) => {
-      const { id } = req.params;
-      const donations = await donationsCollections.findOne({
-        _id: new ObjectId(id),
-      });
-      if (!donations) return res.status(404).send("User not found");
-      res.send(donations);
-    });
+      },
+    );
 
     // ============== donations Get by search and filters Routes ==================
-    app.get("/donations/user/:email", async (req, res) => {
+    app.get("/donations/user/:email", verifyFbToken, async (req, res) => {
       try {
         const { email } = req.params;
         const { status, search, page = 1, limit = 10 } = req.query;
@@ -316,7 +401,7 @@ async function startServer() {
     });
 
     // ============== donations dashboard Get Routes ==================
-    app.get("/donations/dashboard/:email", async (req, res) => {
+    app.get("/donations/dashboard/:email", verifyFbToken, async (req, res) => {
       const { email } = req.params;
       const donations = await donationsCollections
         .find({ requesterEmail: email })
@@ -331,6 +416,16 @@ async function startServer() {
       };
 
       res.send(summary);
+    });
+
+    // ============== donations Get Routes ==================
+    app.get("/donations/:id", verifyFbToken, async (req, res) => {
+      const { id } = req.params;
+      const donations = await donationsCollections.findOne({
+        _id: new ObjectId(id),
+      });
+      if (!donations) return res.status(404).send("User not found");
+      res.send(donations);
     });
 
     // ============== Search Donors Route ==================
@@ -396,14 +491,14 @@ async function startServer() {
     });
 
     // ============== donations Post Routes ==================
-    app.post("/donations", async (req, res) => {
-      const donations = req.body;
-      const result = await donationsCollections.insertOne(donations);
-      res.status(201).send(result);
-    });
+    // app.post("/donations", verifyFbToken, async (req, res) => {
+    //   const donations = req.body;
+    //   const result = await donationsCollections.insertOne(donations);
+    //   res.status(201).send(result);
+    // });
 
     // ============== donations Post Routes for check user is blocked or not==================
-    app.post("/donations", async (req, res) => {
+    app.post("/donations", verifyFbToken, async (req, res) => {
       const donation = req.body;
 
       const user = await userCollection.findOne({
@@ -422,7 +517,7 @@ async function startServer() {
     });
 
     // ============== donations Put Routes ==================
-    app.put("/donations/:id", async (req, res) => {
+    app.put("/donations/:id", verifyFbToken, verifyOwner, async (req, res) => {
       const id = req.params.id;
       const filter = { _id: new ObjectId(id) };
       const updateData = req.body;
@@ -437,168 +532,191 @@ async function startServer() {
     });
 
     // ============== donations patch Routes for change users created posts ==================
-    app.patch("/donations/:id/status", async (req, res) => {
-      const { id } = req.params;
-      const { status } = req.body;
+    app.patch(
+      "/donations/:id/status",
+      verifyFbToken,
+      verifyVolunteer,
+      async (req, res) => {
+        const { id } = req.params;
+        const { status } = req.body;
 
-      const allowedStatus = ["pending", "inprogress", "completed", "canceled"];
-      if (!allowedStatus.includes(status)) {
-        return res.status(400).send({ message: "Invalid status" });
-      }
+        const allowedStatus = [
+          "pending",
+          "inprogress",
+          "completed",
+          "canceled",
+        ];
+        if (!allowedStatus.includes(status)) {
+          return res.status(400).send({ message: "Invalid status" });
+        }
 
-      const result = await donationsCollections.updateOne(
-        { _id: new ObjectId(id) },
-        {
-          $set: {
-            status,
-            updatedAt: new Date(),
+        const result = await donationsCollections.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status,
+              updatedAt: new Date(),
+            },
           },
-        },
-      );
+        );
 
-      res.send(result);
-    });
+        res.send(result);
+      },
+    );
 
     // ============== donations Delete Routes for delete users created posts ==================
-    app.delete("/donations/:id", async (req, res) => {
-      const { id } = req.params;
-      const result = await donationsCollections.deleteOne({
-        _id: new ObjectId(id),
-      });
-      res.send(result);
-    });
+    app.delete(
+      "/donations/:id",
+      verifyFbToken,
+      verifyOwner,
+      async (req, res) => {
+        const { id } = req.params;
+        const result = await donationsCollections.deleteOne({
+          _id: new ObjectId(id),
+        });
+        res.send(result);
+      },
+    );
 
     // ============== donations Delete Routes ==================
-    app.delete("/donations/:id", async (req, res) => {
-      const id = req.params.id;
-      const query = { _id: new ObjectId(id) };
-      const result = await donationsCollections.deleteOne(query);
-      res.send(result);
-    });
+    // app.delete(
+    //   "/donations/:id",
+    //   verifyFbToken,
+    //   verifyOwner,
+    //   async (req, res) => {
+    //     const id = req.params.id;
+    //     const query = { _id: new ObjectId(id) };
+    //     const result = await donationsCollections.deleteOne(query);
+    //     res.send(result);
+    //   },
+    // );
 
     // ============== Dashboard Statistics Routes For Admin ==================
-    app.get("/dashboard/stats", async (req, res) => {
-      try {
-        const totalUsers = await userCollection.countDocuments({
-          role: "donor",
-        });
+    app.get(
+      "/dashboard/stats",
+      verifyFbToken,
+      verifyVolunteer,
+      async (req, res) => {
+        try {
+          const totalUsers = await userCollection.countDocuments({
+            role: "donor",
+          });
 
-        const totalDonationRequests =
-          await donationsCollections.countDocuments();
+          const totalDonationRequests =
+            await donationsCollections.countDocuments();
 
-        // Real total funding from database
-        const fundingResult = await fundingCollections
-          .aggregate([
-            {
-              $group: {
-                _id: null,
-                total: { $sum: "$amount" },
-              },
-            },
-          ])
-          .toArray();
-
-        const totalFunding =
-          fundingResult.length > 0 ? fundingResult[0].total : 0;
-
-        // Blood Group Distribution
-        const bloodGroupStats = await donationsCollections
-          .aggregate([
-            {
-              $group: {
-                _id: "$bloodGroup",
-                count: { $sum: 1 },
-              },
-            },
-          ])
-          .toArray();
-
-        const bloodGroupDistribution = bloodGroupStats.map((item) => ({
-          name: item._id,
-          value: item.count,
-        }));
-
-        // Real Daily Funding Data (Last 30 days)
-        const thirtyDaysAgo = new Date();
-        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
-        const dailyFundingData = await fundingCollections
-          .aggregate([
-            {
-              $match: {
-                paidAt: { $gte: thirtyDaysAgo },
-              },
-            },
-            {
-              $group: {
-                _id: {
-                  year: { $year: "$paidAt" },
-                  month: { $month: "$paidAt" },
-                  day: { $dayOfMonth: "$paidAt" },
+          // Real total funding from database
+          const fundingResult = await fundingCollections
+            .aggregate([
+              {
+                $group: {
+                  _id: null,
+                  total: { $sum: "$amount" },
                 },
-                funding: { $sum: "$amount" },
               },
-            },
-            {
-              $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 },
-            },
-            {
-              $project: {
-                _id: 0,
-                month: {
-                  $concat: [
-                    {
-                      $let: {
-                        vars: {
-                          monthsInString: [
-                            "",
-                            "Jan",
-                            "Feb",
-                            "Mar",
-                            "Apr",
-                            "May",
-                            "Jun",
-                            "Jul",
-                            "Aug",
-                            "Sep",
-                            "Oct",
-                            "Nov",
-                            "Dec",
-                          ],
-                        },
-                        in: {
-                          $arrayElemAt: ["$$monthsInString", "$_id.month"],
+            ])
+            .toArray();
+
+          const totalFunding =
+            fundingResult.length > 0 ? fundingResult[0].total : 0;
+
+          const bloodGroupStats = await donationsCollections
+            .aggregate([
+              {
+                $group: {
+                  _id: "$bloodGroup",
+                  count: { $sum: 1 },
+                },
+              },
+            ])
+            .toArray();
+
+          const bloodGroupDistribution = bloodGroupStats.map((item) => ({
+            name: item._id,
+            value: item.count,
+          }));
+
+          const thirtyDaysAgo = new Date();
+          thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+          const dailyFundingData = await fundingCollections
+            .aggregate([
+              {
+                $match: {
+                  paidAt: { $gte: thirtyDaysAgo },
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    year: { $year: "$paidAt" },
+                    month: { $month: "$paidAt" },
+                    day: { $dayOfMonth: "$paidAt" },
+                  },
+                  funding: { $sum: "$amount" },
+                },
+              },
+              {
+                $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  month: {
+                    $concat: [
+                      {
+                        $let: {
+                          vars: {
+                            monthsInString: [
+                              "",
+                              "Jan",
+                              "Feb",
+                              "Mar",
+                              "Apr",
+                              "May",
+                              "Jun",
+                              "Jul",
+                              "Aug",
+                              "Sep",
+                              "Oct",
+                              "Nov",
+                              "Dec",
+                            ],
+                          },
+                          in: {
+                            $arrayElemAt: ["$$monthsInString", "$_id.month"],
+                          },
                         },
                       },
-                    },
-                    " ",
-                    { $toString: "$_id.day" },
-                  ],
+                      " ",
+                      { $toString: "$_id.day" },
+                    ],
+                  },
+                  funding: 1,
                 },
-                funding: 1,
               },
-            },
-          ])
-          .toArray();
+            ])
+            .toArray();
 
-        res.send({
-          totalUsers,
-          totalFunding,
-          totalDonationRequests,
-          bloodGroupDistribution,
-          monthlyFundingData: dailyFundingData,
-        });
-      } catch (error) {
-        console.error(error);
-        res.status(500).send({
-          message: "Failed to load dashboard stats",
-          error: error.message,
-        });
-      }
-    });
+          res.send({
+            totalUsers,
+            totalFunding,
+            totalDonationRequests,
+            bloodGroupDistribution,
+            monthlyFundingData: dailyFundingData,
+          });
+        } catch (error) {
+          console.error(error);
+          res.status(500).send({
+            message: "Failed to load dashboard stats",
+            error: error.message,
+          });
+        }
+      },
+    );
 
     // ============== Payment Endpoints Get Routes ==================
-    app.get("/funding", async (req, res) => {
+    app.get("/funding", verifyFbToken, async (req, res) => {
       const { limit, session_id } = req.query;
       const query = session_id ? { checkoutSessionId: session_id } : {};
 
@@ -612,7 +730,7 @@ async function startServer() {
     });
 
     // ============== Payment Endpoints Post Routes ==================
-    app.post("/payment-checkout-session", async (req, res) => {
+    app.post("/payment-checkout-session", verifyFbToken, async (req, res) => {
       const paymentInfo = req.body;
 
       if (!paymentInfo?.amount || paymentInfo.amount <= 0) {
@@ -645,7 +763,7 @@ async function startServer() {
     });
 
     // ============== Payment Endpoints Post Routes ==================
-    app.post("/payment-success", async (req, res) => {
+    app.post("/payment-success", verifyFbToken, async (req, res) => {
       const { sessionId } = req.body;
       const session = await stripe.checkout.sessions.retrieve(sessionId);
       const payment = await fundingCollections.findOne({
