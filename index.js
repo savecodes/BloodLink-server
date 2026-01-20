@@ -5,6 +5,9 @@ import dotenv from "dotenv";
 import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
 dotenv.config();
 
+import Stripe from "stripe";
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
 // JSON files load
 const districts = JSON.parse(fs.readFileSync("./districts.json", "utf-8"));
 const upzillas = JSON.parse(fs.readFileSync("./upazilas.json", "utf-8"));
@@ -13,7 +16,12 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors());
+app.use(
+  cors({
+    origin: `${process.env.CLIENT_DOMAIN}`,
+    credentials: true,
+  }),
+);
 app.use(express.json());
 const uri = process.env.MONGO_URI;
 
@@ -41,6 +49,7 @@ async function startServer() {
     const db = client.db("BloodLink");
     const userCollection = db.collection("users");
     const donationsCollections = db.collection("donations");
+    const fundingCollections = db.collection("funding");
 
     // ============== blood-groups Routes ==================
     app.get("/blood-groups", (req, res) => {
@@ -67,39 +76,45 @@ async function startServer() {
       res.json(filtered);
     });
 
-    // ============== All Users Get Routes ==================
-    app.get("/users", async (req, res) => {
-      const { search } = req.query;
-      let query = {};
-      if (search) {
-        query.$or = [
-          { name: { $regex: search, $options: "i" } },
-          { email: { $regex: search, $options: "i" } },
-        ];
-      }
-      const users = await userCollection.find(query).toArray();
-      res.send(users);
-    });
-
-    // ============== Users Routes Get user by email ==================
+    // ============== All Users Get, search, by email  Routes ==================
     app.get("/users", async (req, res) => {
       try {
-        const { email } = req.query;
+        let { search = "", page = 1, limit = 10 } = req.query;
+        page = Number(page);
+        limit = Number(limit);
 
-        if (!email) {
-          return res.status(400).send({ message: "Email query is required" });
+        const query = {};
+        if (search) {
+          query.$or = [
+            { name: { $regex: search, $options: "i" } },
+            { email: { $regex: search, $options: "i" } },
+          ];
         }
 
-        const user = await userCollection.findOne({ email });
+        const skip = (page - 1) * limit;
 
-        if (!user) {
-          return res.status(404).send({ message: "User not found" });
-        }
+        const [data, total] = await Promise.all([
+          userCollection
+            .find(query)
+            .sort({ name: 1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+          userCollection.countDocuments(query),
+        ]);
 
-        res.send(user);
-      } catch (error) {
-        console.error("Get user by email error:", error);
-        res.status(500).send({ message: "Failed to fetch user" });
+        res.send({
+          data,
+          pagination: {
+            total,
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit),
+          },
+        });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Server error" });
       }
     });
 
@@ -183,7 +198,7 @@ async function startServer() {
       const result = await userCollection.findOneAndUpdate(
         { uid: req.params.uid },
         { $set: payload },
-        { returnDocument: "after" }
+        { returnDocument: "after" },
       );
 
       if (!result) {
@@ -194,10 +209,54 @@ async function startServer() {
       res.status(500).send({ message: "Failed to update user" });
     });
 
-    // ============== donations Get Routes ==================
+    // ============== All donations Get Routes ==================
     app.get("/all-donations", async (req, res) => {
-      const donations = await donationsCollections.find().toArray();
-      res.send(donations);
+      try {
+        let { page = 1, limit = 10, search = "", status } = req.query;
+        page = Number(page);
+        limit = Number(limit);
+
+        const query = {};
+
+        if (status && status !== "All Status") {
+          query.status = status.toLowerCase();
+        }
+
+        if (search) {
+          query.$or = [
+            { recipientName: { $regex: search, $options: "i" } },
+            { requesterName: { $regex: search, $options: "i" } },
+            { hospitalName: { $regex: search, $options: "i" } },
+            { bloodGroup: { $regex: search, $options: "i" } },
+          ];
+        }
+
+        const skip = (page - 1) * limit;
+
+        const [data, total] = await Promise.all([
+          donationsCollections
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+
+          donationsCollections.countDocuments(query),
+        ]);
+
+        res.send({
+          data,
+          pagination: {
+            total,
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: "Server error" });
+      }
     });
 
     // ============== donations Get Routes ==================
@@ -213,13 +272,13 @@ async function startServer() {
     // ============== donations Get by search and filters Routes ==================
     app.get("/donations/user/:email", async (req, res) => {
       try {
-        const { email } = req.params; // ✅ Destructure করো
-        const { status, search } = req.query;
+        const { email } = req.params;
+        const { status, search, page = 1, limit = 10 } = req.query;
 
-        let query = { requesterEmail: email };
+        const query = { requesterEmail: email };
 
-        if (status && status.toLowerCase() !== "all") {
-          query.status = status.toLowerCase();
+        if (status && status !== "all") {
+          query.status = status;
         }
 
         if (search) {
@@ -229,10 +288,30 @@ async function startServer() {
           ];
         }
 
-        const donations = await donationsCollections.find(query).toArray();
-        res.send(donations);
-      } catch (error) {
-        res.status(500).send({ message: "server error", error: error.message });
+        const skip = (Number(page) - 1) * Number(limit);
+
+        const [data, total] = await Promise.all([
+          donationsCollections
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(Number(limit))
+            .toArray(),
+
+          donationsCollections.countDocuments(query),
+        ]);
+
+        res.send({
+          data,
+          pagination: {
+            total,
+            page: Number(page),
+            limit: Number(limit),
+            totalPages: Math.ceil(total / limit),
+          },
+        });
+      } catch (err) {
+        res.status(500).send({ message: "Server error" });
       }
     });
 
@@ -279,14 +358,41 @@ async function startServer() {
 
     // ============== Get all pending donation requests ==================
     app.get("/donations", async (req, res) => {
-      const { status } = req.query;
+      try {
+        const { status, page = 1, limit = 10 } = req.query;
 
-      let query = {};
-      if (status) {
-        query.status = status.toLowerCase();
+        const query = {};
+        if (status) {
+          query.status = status.toLowerCase();
+        }
+
+        const skip = (Number(page) - 1) * Number(limit);
+
+        // Fetch data & total count in parallel
+        const [data, total] = await Promise.all([
+          donationsCollections
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(Number(limit))
+            .toArray(),
+
+          donationsCollections.countDocuments(query),
+        ]);
+
+        res.send({
+          data,
+          pagination: {
+            total,
+            page: Number(page),
+            limit: Number(limit),
+            totalPages: Math.ceil(total / limit),
+          },
+        });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Server error" });
       }
-      const donations = await donationsCollections.find(query).toArray();
-      res.send(donations);
     });
 
     // ============== donations Post Routes ==================
@@ -330,6 +436,38 @@ async function startServer() {
       res.send(result);
     });
 
+    // ============== donations patch Routes for change users created posts ==================
+    app.patch("/donations/:id/status", async (req, res) => {
+      const { id } = req.params;
+      const { status } = req.body;
+
+      const allowedStatus = ["pending", "inprogress", "completed", "canceled"];
+      if (!allowedStatus.includes(status)) {
+        return res.status(400).send({ message: "Invalid status" });
+      }
+
+      const result = await donationsCollections.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status,
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      res.send(result);
+    });
+
+    // ============== donations Delete Routes for delete users created posts ==================
+    app.delete("/donations/:id", async (req, res) => {
+      const { id } = req.params;
+      const result = await donationsCollections.deleteOne({
+        _id: new ObjectId(id),
+      });
+      res.send(result);
+    });
+
     // ============== donations Delete Routes ==================
     app.delete("/donations/:id", async (req, res) => {
       const id = req.params.id;
@@ -347,7 +485,21 @@ async function startServer() {
 
         const totalDonationRequests =
           await donationsCollections.countDocuments();
-        const totalFunding = 0;
+
+        // Real total funding from database
+        const fundingResult = await fundingCollections
+          .aggregate([
+            {
+              $group: {
+                _id: null,
+                total: { $sum: "$amount" },
+              },
+            },
+          ])
+          .toArray();
+
+        const totalFunding =
+          fundingResult.length > 0 ? fundingResult[0].total : 0;
 
         // Blood Group Distribution
         const bloodGroupStats = await donationsCollections
@@ -366,24 +518,78 @@ async function startServer() {
           value: item.count,
         }));
 
-        // Monthly Funding (dummy data for now)
-        const monthlyFundingData = [
-          { month: "Jan", funding: 5000 },
-          { month: "Feb", funding: 7500 },
-          { month: "Mar", funding: 6200 },
-          { month: "Apr", funding: 8900 },
-          { month: "May", funding: 12000 },
-          { month: "Jun", funding: 10500 },
-        ];
+        // Real Daily Funding Data (Last 30 days)
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+        const dailyFundingData = await fundingCollections
+          .aggregate([
+            {
+              $match: {
+                paidAt: { $gte: thirtyDaysAgo },
+              },
+            },
+            {
+              $group: {
+                _id: {
+                  year: { $year: "$paidAt" },
+                  month: { $month: "$paidAt" },
+                  day: { $dayOfMonth: "$paidAt" },
+                },
+                funding: { $sum: "$amount" },
+              },
+            },
+            {
+              $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 },
+            },
+            {
+              $project: {
+                _id: 0,
+                month: {
+                  $concat: [
+                    {
+                      $let: {
+                        vars: {
+                          monthsInString: [
+                            "",
+                            "Jan",
+                            "Feb",
+                            "Mar",
+                            "Apr",
+                            "May",
+                            "Jun",
+                            "Jul",
+                            "Aug",
+                            "Sep",
+                            "Oct",
+                            "Nov",
+                            "Dec",
+                          ],
+                        },
+                        in: {
+                          $arrayElemAt: ["$$monthsInString", "$_id.month"],
+                        },
+                      },
+                    },
+                    " ",
+                    { $toString: "$_id.day" },
+                  ],
+                },
+                funding: 1,
+              },
+            },
+          ])
+          .toArray();
 
         res.send({
           totalUsers,
           totalFunding,
           totalDonationRequests,
           bloodGroupDistribution,
-          monthlyFundingData,
+          monthlyFundingData: dailyFundingData,
         });
       } catch (error) {
+        console.error(error);
         res.status(500).send({
           message: "Failed to load dashboard stats",
           error: error.message,
@@ -391,9 +597,81 @@ async function startServer() {
       }
     });
 
+    // ============== Payment Endpoints Get Routes ==================
+    app.get("/funding", async (req, res) => {
+      const { limit, session_id } = req.query;
+      const query = session_id ? { checkoutSessionId: session_id } : {};
+
+      const result = await fundingCollections
+        .find(query)
+        .sort({ paidAt: -1 })
+        .limit(parseInt(limit) || 10)
+        .toArray();
+
+      res.send(result);
+    });
+
+    // ============== Payment Endpoints Post Routes ==================
+    app.post("/payment-checkout-session", async (req, res) => {
+      const paymentInfo = req.body;
+
+      if (!paymentInfo?.amount || paymentInfo.amount <= 0) {
+        return res.status(400).send({ message: "Invalid amount" });
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        line_items: [
+          {
+            price_data: {
+              currency: paymentInfo?.currency || "usd",
+              product_data: {
+                name: paymentInfo?.purpose || "Platform Funding",
+              },
+              unit_amount: paymentInfo?.amount * 100,
+            },
+            quantity: 1,
+          },
+        ],
+        customer_email: paymentInfo?.email,
+        mode: "payment",
+        metadata: {
+          userName: paymentInfo.name,
+          userImage: paymentInfo.image,
+        },
+        success_url: `${process.env.CLIENT_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.CLIENT_DOMAIN}/dashboard/payment-cancelled`,
+      });
+      res.send({ url: session.url });
+    });
+
+    // ============== Payment Endpoints Post Routes ==================
+    app.post("/payment-success", async (req, res) => {
+      const { sessionId } = req.body;
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      const payment = await fundingCollections.findOne({
+        paymentIntentId: session.payment_intent,
+      });
+      if (session.status === "complete" && !payment) {
+        const userInfo = {
+          name: session.customer_details?.name || "Anonymous",
+          email: session.customer_details?.email,
+          image: session.metadata?.userImage || null,
+          amount: session.amount_total / 100,
+          currency: session.currency,
+          paymentIntentId: session.payment_intent,
+          checkoutSessionId: session.id,
+          paymentStatus: session.payment_status,
+          paidAt: new Date(session.created * 1000),
+        };
+        const result = await fundingCollections.insertOne(userInfo);
+        return res.send({ inserted: true });
+      }
+      return res.send({ inserted: false });
+    });
+
     await client.db("admin").command({ ping: 1 });
     console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
+      "Pinged your deployment. You successfully connected to MongoDB!",
     );
   } finally {
     // await client.close();
